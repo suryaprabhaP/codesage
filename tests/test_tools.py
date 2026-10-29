@@ -57,3 +57,69 @@ def test_bad_json_and_unknown_tool_return_errors(project):
 
 def test_dict_arguments_are_accepted(project):
     assert "Demo" in run_tool(project, "read_file", {"path": "README.md"})
+
+
+# ---- Edit tools ----------------------------------------------------------
+
+def approve(change):
+    return True
+
+
+def reject(change):
+    return False
+
+
+def test_edit_file_replaces_text_after_approval(project):
+    args = {"path": "app/main.py", "old_text": "Hello", "new_text": "Hi"}
+    assert run_tool(project, "edit_file", args, confirm=approve) == "Updated app/main.py."
+    assert "Hi {name}" in (project / "app" / "main.py").read_text()
+
+
+def test_rejected_edit_writes_nothing(project):
+    before = (project / "app" / "main.py").read_text()
+    args = {"path": "app/main.py", "old_text": "Hello", "new_text": "Hi"}
+    assert "rejected" in run_tool(project, "edit_file", args, confirm=reject)
+    assert (project / "app" / "main.py").read_text() == before
+
+
+def test_edit_without_confirm_is_refused(project):
+    args = {"path": "app/main.py", "old_text": "Hello", "new_text": "Hi"}
+    assert "rejected" in run_tool(project, "edit_file", args)
+    assert "Hello" in (project / "app" / "main.py").read_text()
+
+
+def test_edit_file_text_not_found(project):
+    args = {"path": "app/main.py", "old_text": "missing", "new_text": "x"}
+    assert "not found" in run_tool(project, "edit_file", args, confirm=approve)
+
+
+def test_edit_file_text_must_be_unique(project):
+    (project / "dup.txt").write_text("a\na\n")
+    args = {"path": "dup.txt", "old_text": "a", "new_text": "b"}
+    assert "appears 2 times" in run_tool(project, "edit_file", args, confirm=approve)
+
+
+def test_write_file_creates_folders(project):
+    args = {"path": "new/dir/hello.txt", "content": "hi\n"}
+    assert run_tool(project, "write_file", args, confirm=approve) == "Created new/dir/hello.txt."
+    assert (project / "new" / "dir" / "hello.txt").read_text() == "hi\n"
+
+
+def test_write_file_outside_project_is_refused(project):
+    args = {"path": "../evil.txt", "content": "x"}
+    assert "outside the project" in run_tool(project, "write_file", args, confirm=approve)
+
+
+def test_diff_shown_to_user(project):
+    seen = []
+    args = {"path": "app/main.py", "old_text": "Hello", "new_text": "Hi"}
+    run_tool(project, "edit_file", args, confirm=lambda change: seen.append(change.diff()))
+    assert "-    return f'Hello {name}'" in seen[0]
+    assert "+    return f'Hi {name}'" in seen[0]
+
+
+def test_edit_keeps_windows_line_endings(project):
+    (project / "crlf.txt").write_bytes(b"one\r\ntwo\r\n")
+    args = {"path": "crlf.txt", "old_text": "two", "new_text": "2"}
+    run_tool(project, "edit_file", args, confirm=approve)
+    assert (project / "crlf.txt").read_bytes() == b"one\r\n2\r\n"

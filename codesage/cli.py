@@ -1,6 +1,7 @@
 """Interactive terminal chat loop."""
 
-import os
+import json
+from pathlib import Path
 
 import openai
 from prompt_toolkit import PromptSession
@@ -14,11 +15,21 @@ from rich.text import Text
 from codesage import __version__
 from codesage.config import load_config
 from codesage.llm import LLM
+from codesage.tools import TOOLS, run_tool
 
 console = Console()
 
+# Safety limit so a confused model can't call tools forever.
+MAX_TOOL_ROUNDS = 10
+
 SYSTEM_PROMPT = """You are CodeSage, an AI coding assistant running in the user's terminal.
-The user's current working directory is: {cwd}
+You are working in the user's project folder: {cwd}
+
+You have tools to look at the project: list_files, read_file and search_code.
+Use them whenever a question is about the user's code, instead of guessing.
+search_code only shows single lines: read_file the match before explaining it
+or naming a line number. All paths are relative to the project folder.
+
 Be concise and direct. Use Markdown, and put code in fenced code blocks."""
 
 HELP = """[bold]Commands[/bold]
@@ -28,9 +39,13 @@ HELP = """[bold]Commands[/bold]
 Press Ctrl+C while a reply is streaming to stop it."""
 
 
-def stream_reply(llm: LLM, messages: list[dict]) -> str:
-    """Stream the model's reply to the screen and return the full answer text."""
+def stream_reply(llm: LLM, messages: list[dict]) -> tuple[str, list[dict]]:
+    """Stream the model's reply to the screen.
+
+    Returns the answer text and any tool calls the model asked for.
+    """
     thinking, answer = "", ""
+    tool_calls = []
 
     def render():
         parts = []
@@ -43,16 +58,68 @@ def stream_reply(llm: LLM, messages: list[dict]) -> str:
 
     with Live(render(), console=console, refresh_per_second=12, transient=False) as live:
         try:
-            for kind, chunk in llm.stream_chat(messages):
+            for kind, value in llm.stream_chat(messages, tools=TOOLS):
                 if kind == "thinking":
-                    thinking += chunk
+                    thinking += value
+                elif kind == "text":
+                    answer += value
                 else:
-                    answer += chunk
+                    tool_calls.append(value)
                 live.update(render())
         except KeyboardInterrupt:
             answer += "\n\n*[stopped]*"
             live.update(render())
-    return answer
+            return answer, []
+    return answer, tool_calls
+
+
+def show_tool_call(call: dict, result: str) -> None:
+    """Print one line for the call and a short summary of its result."""
+    try:
+        args = json.loads(call["arguments"] or "{}")
+        args_text = ", ".join(f"{k}={v!r}" for k, v in args.items())
+    except json.JSONDecodeError:
+        args_text = call["arguments"]
+    console.print(f"[cyan]●[/cyan] [bold]{call['name']}[/bold]([dim]{args_text}[/dim])")
+
+    if result.startswith("Error:"):
+        console.print(f"  [red]└ {result}[/red]")
+    else:
+        console.print(f"  [dim]└ {len(result.splitlines())} lines[/dim]")
+
+
+def run_turn(llm: LLM, messages: list[dict], root: Path) -> None:
+    """Get the model's reply, running any tools it asks for, until it gives a final answer.
+
+    This is the agent loop: model asks for a tool -> we run it -> the result goes
+    back into messages -> the model is called again with that new information.
+    """
+    for _ in range(MAX_TOOL_ROUNDS):
+        answer, tool_calls = stream_reply(llm, messages)
+        if not tool_calls:
+            messages.append({"role": "assistant", "content": answer})
+            return
+
+        # The assistant message must list its tool calls, and each tool result
+        # must point back to its call by id, or the API rejects the history.
+        messages.append({
+            "role": "assistant",
+            "content": answer,
+            "tool_calls": [
+                {
+                    "id": c["id"],
+                    "type": "function",
+                    "function": {"name": c["name"], "arguments": c["arguments"]},
+                }
+                for c in tool_calls
+            ],
+        })
+        for call in tool_calls:
+            result = run_tool(root, call["name"], call["arguments"])
+            show_tool_call(call, result)
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+
+    console.print(f"[yellow]Stopped after {MAX_TOOL_ROUNDS} rounds of tool calls.[/yellow]")
 
 
 def main():
@@ -72,7 +139,8 @@ def main():
         )
     )
 
-    system = {"role": "system", "content": SYSTEM_PROMPT.format(cwd=os.getcwd())}
+    root = Path.cwd().resolve()
+    system = {"role": "system", "content": SYSTEM_PROMPT.format(cwd=root)}
     messages = [system]
     session = PromptSession(history=InMemoryHistory())
 
@@ -96,22 +164,20 @@ def main():
             console.print("[dim]Conversation cleared.[/dim]")
             continue
 
+        # Remember where this turn started, so a failed turn can be undone cleanly.
+        turn_start = len(messages)
         messages.append({"role": "user", "content": user_input})
         try:
-            reply = stream_reply(llm, messages)
+            run_turn(llm, messages, root)
         except openai.APIConnectionError:
             console.print(
                 f"[red]Can't reach {config.provider} at {config.base_url}.[/red]"
                 + (" Is Ollama running? Try: [bold]ollama serve[/bold]" if config.provider == "ollama" else "")
             )
-            messages.pop()
-            continue
+            del messages[turn_start:]
         except openai.APIError as e:
             console.print(f"[red]API error:[/red] {e}")
-            messages.pop()
-            continue
-
-        messages.append({"role": "assistant", "content": reply})
+            del messages[turn_start:]
 
     console.print("[dim]Bye![/dim]")
 

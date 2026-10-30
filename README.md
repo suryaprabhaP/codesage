@@ -14,6 +14,9 @@ A terminal AI coding agent that runs for free on a local LLM.
 - **Tool calling:** the agent explores your project with `list_files`, `read_file` and `search_code`
 - Tools are sandboxed to the project folder and skip `.git`, `.venv`, `node_modules` and caches
 - **File editing:** `edit_file` and `write_file`, shown as a colored diff that you approve or reject first
+- **Running commands:** `run_command` runs tests or scripts after you approve; answer "always" to stop being asked about the same command for the rest of the session
+- Dangerous commands (`rm -rf /`, `format`, `shutdown`, `git push --force`, piping downloads into a shell, ...) are blocked outright
+- A live timer while the model works, and how long each step took
 
 ## How it works
 
@@ -22,6 +25,8 @@ All three providers accept the OpenAI chat API format, so CodeSage uses one clie
 **The agent loop:** CodeSage sends the model a JSON description of each tool. When the model asks for a tool, CodeSage runs it, adds the result to `messages` as a `tool` message, and calls the model again. This repeats until the model replies with a final answer (at most 10 rounds).
 
 **Safe editing:** edit tools never write directly. They return a proposed change; the user sees a diff and answers yes or no, and only then is the file written. `edit_file` replaces an exact piece of text that must appear exactly once, so an edit can never land in the wrong place.
+
+**Safe commands:** `run_command` follows the same pattern. The user sees the exact command and answers yes, always (for this session) or no. Commands run in the project folder (PowerShell on Windows, `sh` elsewhere) with no input, a timeout, the real exit code, and long output cut to its start and end. A short blocklist refuses commands that are easy to approve by accident and impossible to undo; the yes/no prompt is the main safety, the blocklist is a second line of defence.
 
 The agent loop (`agent.py`) knows nothing about the terminal: it talks to the screen through a small UI interface. That keeps the loop testable with a fake model and a fake UI.
 
@@ -61,6 +66,10 @@ Run `codesage` from inside the project you want it to work on; that folder is wh
 $env:OLLAMA_CONTEXT_LENGTH = "8192"; ollama serve
 ```
 
+## Speed
+
+`qwen3:4b` reasons before every answer, so a multi-step task takes a few minutes on a 6 GB GPU. Turning that reasoning off does not help with this model: with `reasoning_effort="none"` (or Ollama's native `think: false`) qwen3:4b moves its reasoning into the answer text instead. On the same run-fix-rerun task, normal mode took 196 s and "thinking off" took 489 s with a cluttered answer, so CodeSage keeps normal mode. For faster replies, use a larger GPU or the Groq free tier (`CODESAGE_PROVIDER=groq`).
+
 ## Tests
 
 ```bash
@@ -73,7 +82,7 @@ pytest
 - [x] Day 1: terminal chat with streaming, local LLM via Ollama
 - [x] Day 2: tool calling (`read_file`, `list_files`, `search_code`)
 - [x] Day 3: agent loop + file editing with confirmation
-- [ ] Day 4: `run_command` with permission prompts, nicer UI
+- [x] Day 4: `run_command` with permission prompts, nicer UI
 - [ ] Day 5: saved sessions (SQLite) + context management
 - [ ] Day 6: RAG over the codebase (ChromaDB + sentence-transformers)
 - [ ] Day 7: demo GIF, docs, release

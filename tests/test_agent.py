@@ -31,8 +31,10 @@ class BrokenLLM:
 
 
 class FakeUI:
-    def __init__(self, approve: bool = True):
+    def __init__(self, approve: bool = True, command_answer: str = "yes"):
         self.approve = approve
+        self.command_answer = command_answer
+        self.commands_asked = []
         self.tool_lines = []
         self.warnings = []
 
@@ -50,6 +52,10 @@ class FakeUI:
 
     def confirm_change(self, change):
         return self.approve
+
+    def confirm_command(self, command):
+        self.commands_asked.append(command.command)
+        return self.command_answer
 
     def warn(self, text):
         self.warnings.append(text)
@@ -113,6 +119,34 @@ def test_failed_turn_restores_history(project):
     with pytest.raises(ConnectionError):
         agent.ask("hello")
     assert [m["role"] for m in agent.messages] == ["system"]
+
+
+def test_always_allow_skips_the_second_question(project):
+    llm = FakeLLM(
+        [tool_call("run_command", command="echo hi")],
+        [tool_call("run_command", command="echo hi", call_id="call_2")],
+        [("text", "Done.")],
+    )
+    ui = FakeUI(command_answer="always")
+    agent = Agent(llm, project, ui)
+    agent.ask("run it twice")
+    assert ui.commands_asked == ["echo hi"]
+    assert agent.messages[3]["content"].startswith("Exit code: 0")
+    assert agent.messages[5]["content"].startswith("Exit code: 0")
+
+
+def test_always_allow_survives_clear(project):
+    agent = Agent(FakeLLM(), project, FakeUI())
+    agent.allowed_commands.add("pytest")
+    agent.reset()
+    assert "pytest" in agent.allowed_commands
+
+
+def test_command_answer_no(project):
+    llm = FakeLLM([tool_call("run_command", command="echo hi")], [("text", "OK.")])
+    agent = Agent(llm, project, FakeUI(command_answer="no"))
+    agent.ask("run it")
+    assert "did not allow" in agent.messages[3]["content"]
 
 
 def test_reset_clears_conversation(project):

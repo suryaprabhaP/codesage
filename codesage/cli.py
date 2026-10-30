@@ -1,6 +1,7 @@
 """Interactive terminal front end for the agent."""
 
 import json
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -11,24 +12,26 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
+from rich.spinner import Spinner
 from rich.text import Text
 
 from codesage import __version__
 from codesage.agent import Agent
 from codesage.config import load_config
 from codesage.llm import LLM
-from codesage.tools import REJECTED_MESSAGE, FileChange
+from codesage.tools import COMMAND_REJECTED_MESSAGE, REJECTED_MESSAGE, Command, FileChange
 
 console = Console()
 
-# Long diffs are cut short on screen so the prompt stays visible.
+# Long diffs and command output are cut short on screen so the prompt stays visible.
 MAX_DIFF_LINES = 80
+MAX_OUTPUT_PREVIEW_LINES = 8
 
 HELP = """[bold]Commands[/bold]
-  /help    show this help
-  /clear   start a fresh conversation
-  /exit    quit (or press Ctrl+D)
+  /help         show this help
+  /clear        start a fresh conversation
+  /exit         quit (or press Ctrl+D)
 Press Ctrl+C while a reply is streaming to stop it."""
 
 
@@ -59,17 +62,28 @@ class TerminalUI:
     def stream_reply(self, events: Iterator[tuple[str, str | dict]]) -> tuple[str, list[dict]]:
         thinking, answer = "", ""
         tool_calls = []
+        start = time.monotonic()
+        done = False
 
         def render():
-            parts = []
-            if thinking and not answer:
-                # Show only the tail of the reasoning so it doesn't flood the screen.
-                parts.append(Text("thinking… " + thinking[-300:].replace("\n", " "), style="dim italic"))
+            seconds = int(time.monotonic() - start)
             if answer:
-                parts.append(Markdown(answer))
-            return Group(*parts)
+                return Markdown(answer)
+            if done:
+                # Don't leave a frozen spinner behind when the reply was only tool calls.
+                return Text(f"thought for {seconds}s" if thinking else "", style="dim italic")
+            if thinking:
+                # Show only the tail of the reasoning so it doesn't flood the screen.
+                tail = thinking[-300:].replace("\n", " ")
+                return Group(
+                    Spinner("dots", text=Text(f"Thinking… {seconds}s", style="cyan")),
+                    Text(tail, style="dim italic"),
+                )
+            return Spinner("dots", text=Text(f"Waiting for the model… {seconds}s", style="cyan"))
 
-        with Live(render(), console=console, refresh_per_second=12, transient=False) as live:
+        # get_renderable makes Live redraw on its own, so the timer keeps
+        # ticking even while the model is silent.
+        with Live(get_renderable=render, console=console, refresh_per_second=12) as live:
             try:
                 for kind, value in events:
                     if kind == "thinking":
@@ -78,11 +92,15 @@ class TerminalUI:
                         answer += value
                     else:
                         tool_calls.append(value)
-                    live.update(render())
             except KeyboardInterrupt:
                 answer += "\n\n*[stopped]*"
-                live.update(render())
+                live.refresh()
                 return answer, []
+            done = True
+            live.refresh()
+
+        if answer.strip():
+            console.print(f"[dim]{time.monotonic() - start:.1f}s[/dim]")
         return answer, tool_calls
 
     def show_tool_call(self, call: dict, result: str) -> None:
@@ -98,8 +116,17 @@ class TerminalUI:
 
         if result.startswith("Error:"):
             console.print(f"  [red]└ {result}[/red]")
-        elif result == REJECTED_MESSAGE:
+        elif result in (REJECTED_MESSAGE, COMMAND_REJECTED_MESSAGE):
             console.print("  [yellow]└ Rejected[/yellow]")
+        elif call["name"] == "run_command":
+            exit_line, _, output = result.partition("\n")
+            color = "green" if exit_line == "Exit code: 0" else "red"
+            console.print(f"  [{color}]└ {exit_line}[/{color}]")
+            lines = output.splitlines()
+            for line in lines[:MAX_OUTPUT_PREVIEW_LINES]:
+                console.print(Text(f"    {line}", style="dim"))
+            if len(lines) > MAX_OUTPUT_PREVIEW_LINES:
+                console.print(f"    [dim]... {len(lines) - MAX_OUTPUT_PREVIEW_LINES} more lines[/dim]")
         elif call["name"] in ("write_file", "edit_file"):
             console.print(f"  [green]└ {result}[/green]")
         else:
@@ -114,6 +141,27 @@ class TerminalUI:
             return Confirm.ask("Apply this change?", default=False, console=console)
         except (KeyboardInterrupt, EOFError):
             return False
+
+    def confirm_command(self, command: Command) -> str:
+        console.print(
+            Panel(
+                Text(f"$ {command.command}", style="bold"),
+                title="Run command",
+                subtitle=f"in {command.cwd} · timeout {command.timeout}s",
+                border_style="yellow",
+            )
+        )
+        try:
+            answer = Prompt.ask(
+                "Run it? [bold]y[/bold]es / [bold]a[/bold]lways this session / [bold]n[/bold]o",
+                choices=["y", "a", "n"],
+                default="n",
+                show_choices=False,
+                console=console,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return "no"
+        return {"y": "yes", "a": "always"}.get(answer, "no")
 
     def warn(self, text: str) -> None:
         console.print(f"[yellow]{text}[/yellow]")

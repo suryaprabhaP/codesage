@@ -3,14 +3,16 @@
 Each tool is a plain Python function plus a JSON schema (TOOLS) that tells
 the model what the tool does and which arguments it takes.
 
-Read tools return text. Edit tools return a FileChange: nothing is written
-until the user has seen the diff and said yes (see run_tool).
+Read tools return text. Edit tools return a FileChange and run_command
+returns a Command: nothing is written or run until the user says yes
+(see run_tool).
 """
 
 import difflib
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,8 +25,28 @@ MAX_LIST_ENTRIES = 200
 MAX_READ_LINES = 400
 MAX_SEARCH_RESULTS = 50
 MAX_FILE_BYTES = 1_000_000
+MAX_OUTPUT_CHARS = 10_000
+DEFAULT_TIMEOUT = 120
+MAX_TIMEOUT = 600
 
 REJECTED_MESSAGE = "The user rejected this change, so nothing was written. Ask them what they would like instead."
+COMMAND_REJECTED_MESSAGE = "The user did not allow this command, so it was not run. Ask them what they would like instead."
+
+# Windows runs commands in PowerShell, everything else in sh.
+SHELL_NAME = "Windows PowerShell" if os.name == "nt" else "sh"
+
+# Refused outright, even if the user would say yes: easy to approve by
+# accident and impossible to undo. The yes/no prompt is the real safety;
+# this list is a second line of defence, not a complete one.
+BLOCKED_COMMANDS = [
+    r"\brm\s+-\w*\s+(/|~|\*)(\s|$)",           # rm -rf /  rm -rf ~  rm -rf *
+    r"\bremove-item\b.*\s(/|~|\*|[a-z]:\\?)(\s|$)",
+    r"\bdel\s+/[sq]\b",
+    r"\b(format|mkfs|diskpart)\b",
+    r"\b(shutdown|reboot|restart-computer|stop-computer)\b",
+    r"\bgit\s+push\b.*(--force|-f\b)",
+    r"\b(curl|wget|iwr|invoke-webrequest)\b.*\|\s*(sh|bash|iex|invoke-expression)\b",
+]
 
 
 class ToolError(Exception):
@@ -49,6 +71,15 @@ class FileChange:
             lineterm="",
         )
         return "\n".join(lines)
+
+
+@dataclass
+class Command:
+    """A shell command the model wants to run, shown to the user before it runs."""
+
+    command: str
+    cwd: Path
+    timeout: int
 
 
 def _resolve(root: Path, path: str) -> Path:
@@ -186,6 +217,58 @@ def apply_change(change: FileChange) -> None:
         f.write(change.new)
 
 
+# ---- run_command (returns a Command; nothing is run here) ----------------
+
+def run_command(root: Path, command: str, timeout: int = DEFAULT_TIMEOUT) -> Command:
+    command = command.strip()
+    if not command:
+        raise ToolError("command must not be empty.")
+    for pattern in BLOCKED_COMMANDS:
+        if re.search(pattern, command, re.IGNORECASE):
+            raise ToolError(f"'{command}' is blocked for safety and will not be run.")
+    return Command(command, root, max(1, min(int(timeout), MAX_TIMEOUT)))
+
+
+def _truncate(text: str) -> str:
+    """Keep the start and end of long output; the middle is usually least useful."""
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    half = MAX_OUTPUT_CHARS // 2
+    return f"{text[:half]}\n... ({len(text) - MAX_OUTPUT_CHARS} characters cut) ...\n{text[-half:]}"
+
+
+def execute(cmd: Command) -> str:
+    if os.name == "nt":
+        # Make PowerShell send UTF-8 so non-English output isn't garbled, and pass
+        # on the program's real exit code (PowerShell otherwise reports 1 for any failure).
+        script = (
+            f"[Console]::OutputEncoding = [Text.Encoding]::UTF8; {cmd.command}\n"
+            "if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif (-not $?) { exit 1 }"
+        )
+        args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+    else:
+        args = ["/bin/sh", "-c", cmd.command]
+
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=cmd.cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=cmd.timeout,
+            stdin=subprocess.DEVNULL,  # a command waiting for input would hang forever
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: the command did not finish within {cmd.timeout} seconds and was stopped."
+    except OSError as e:
+        return f"Error: could not start the command: {e}"
+
+    output = (proc.stdout + proc.stderr).strip()
+    return f"Exit code: {proc.returncode}\n{_truncate(output) or '(no output)'}"
+
+
 # ---- Schemas the model reads ---------------------------------------------
 
 TOOLS = [
@@ -268,6 +351,28 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                f"Run a shell command ({SHELL_NAME}) in the project folder and return its output "
+                "and exit code, e.g. to run tests or a script. The user must approve it. "
+                "Do not start servers or interactive programs: they will time out."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command line to run."},
+                    "timeout": {
+                        "type": "integer",
+                        "description": f"Seconds before the command is stopped. Default {DEFAULT_TIMEOUT}, max {MAX_TIMEOUT}.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 _READ_TOOLS = {
@@ -285,14 +390,16 @@ def run_tool(
     root: Path,
     name: str,
     arguments: str | dict,
-    confirm: Callable[[FileChange], bool] | None = None,
+    confirm_change: Callable[[FileChange], bool] | None = None,
+    confirm_command: Callable[[Command], bool] | None = None,
 ) -> str:
     """Run one tool call from the model. Always returns text and never raises,
     so a mistake by the model becomes an error message it can react to.
 
-    Edit tools only write after confirm(change) returns True.
+    Edit tools only write after confirm_change(change) returns True, and
+    run_command only runs after confirm_command(command) returns True.
     """
-    if name not in _READ_TOOLS and name not in _EDIT_TOOLS:
+    if name not in _READ_TOOLS and name not in _EDIT_TOOLS and name != "run_command":
         return f"Error: unknown tool '{name}'."
 
     if isinstance(arguments, dict):
@@ -307,16 +414,22 @@ def run_tool(
         if name in _READ_TOOLS:
             return _READ_TOOLS[name](root, **args)
 
+        if name == "run_command":
+            cmd = run_command(root, **args)
+            if confirm_command is None or not confirm_command(cmd):
+                return COMMAND_REJECTED_MESSAGE
+            return execute(cmd)
+
         change = _EDIT_TOOLS[name](root, **args)
         if change.old == change.new:
             return f"No change: {change.rel_path} already has that content."
-        if confirm is None or not confirm(change):
+        if confirm_change is None or not confirm_change(change):
             return REJECTED_MESSAGE
         apply_change(change)
         return f"{'Created' if change.old is None else 'Updated'} {change.rel_path}."
     except ToolError as e:
         return f"Error: {e}"
-    except TypeError as e:
+    except (TypeError, ValueError) as e:
         return f"Error: wrong arguments for {name}: {e}"
     except OSError as e:
         return f"Error: could not write the file: {e}"

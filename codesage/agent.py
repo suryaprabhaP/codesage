@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Protocol
 
 from codesage.llm import LLM
-from codesage.tools import TOOLS, FileChange, run_tool
+from codesage.tools import SHELL_NAME, TOOLS, Command, FileChange, run_tool
 
 # Safety limit so a confused model can't call tools forever.
 MAX_TOOL_ROUNDS = 10
@@ -28,6 +28,11 @@ Tools for changing the project: edit_file and write_file.
 - The user sees a diff and must approve every change. If they reject it, ask
   what they would like instead; do not retry the same change.
 
+Tool for running commands: run_command (e.g. run tests or a script).
+- Commands run in {shell} inside the project folder.{shell_note}
+- The user must approve each command. Never start servers or interactive
+  programs; they will time out.
+
 All paths are relative to the project folder.
 Be concise and direct. Use Markdown, and put code in fenced code blocks."""
 
@@ -44,6 +49,9 @@ class UI(Protocol):
     def confirm_change(self, change: FileChange) -> bool:
         """Show a proposed file change and ask the user to approve it."""
 
+    def confirm_command(self, command: Command) -> str:
+        """Show a command and ask: "yes" (once), "always" (this session) or "no"."""
+
     def warn(self, text: str) -> None:
         """Show a warning."""
 
@@ -53,11 +61,25 @@ class Agent:
         self.llm = llm
         self.root = root
         self.ui = ui
+        # Commands the user chose "always" for. Kept until CodeSage exits,
+        # even across /clear, because it is a choice about the user's machine.
+        self.allowed_commands: set[str] = set()
         self.reset()
 
     def reset(self) -> None:
         """Start a fresh conversation."""
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT.format(cwd=self.root)}]
+        shell_note = " Use ';' between commands, not '&&'." if SHELL_NAME == "Windows PowerShell" else ""
+        prompt = SYSTEM_PROMPT.format(cwd=self.root, shell=SHELL_NAME, shell_note=shell_note)
+        self.messages = [{"role": "system", "content": prompt}]
+
+    def confirm_command(self, command: Command) -> bool:
+        """Ask the user about a command, unless they already chose "always" for it."""
+        if command.command in self.allowed_commands:
+            return True
+        answer = self.ui.confirm_command(command)
+        if answer == "always":
+            self.allowed_commands.add(command.command)
+        return answer in ("yes", "always")
 
     def ask(self, user_input: str) -> None:
         """Handle one user message. If anything fails, the history is restored."""
@@ -95,7 +117,11 @@ class Agent:
             })
             for call in tool_calls:
                 result = run_tool(
-                    self.root, call["name"], call["arguments"], confirm=self.ui.confirm_change
+                    self.root,
+                    call["name"],
+                    call["arguments"],
+                    confirm_change=self.ui.confirm_change,
+                    confirm_command=self.confirm_command,
                 )
                 self.ui.show_tool_call(call, result)
                 self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})

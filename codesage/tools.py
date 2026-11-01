@@ -170,6 +170,32 @@ def search_code(root: Path, pattern: str, path: str = ".") -> str:
     return "\n".join(matches) or f"No matches for '{pattern}'."
 
 
+# One index per project, opened the first time it is needed.
+_indexes: dict[Path, object] = {}
+
+
+def get_index(root: Path):
+    # Imported here because ChromaDB takes seconds to load, and most runs may not need it.
+    from codesage.rag import CodeIndex
+
+    if root not in _indexes:
+        _indexes[root] = CodeIndex(root)
+    return _indexes[root]
+
+
+def search_meaning(root: Path, query: str, limit: int = 5) -> str:
+    try:
+        from codesage.rag import format_results
+
+        index = get_index(root)
+        index.update()  # only re-embeds files that changed, so results are never stale
+        return format_results(index.search(query, limit=max(1, min(int(limit), 10))))
+    except (TypeError, ValueError):
+        raise
+    except Exception as e:  # missing library, model download failure, corrupt index...
+        raise ToolError(f"meaning search is unavailable ({e}). Use search_code instead.") from e
+
+
 # ---- Edit tools (return a FileChange; nothing is written here) -----------
 
 def write_file(root: Path, path: str, content: str) -> FileChange:
@@ -320,6 +346,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_meaning",
+            "description": (
+                "Find code by what it does, when you don't know the exact words, e.g. 'where are "
+                "conversations saved'. Returns the closest pieces of code. For exact names use search_code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What you are looking for, in plain English."},
+                    "limit": {"type": "integer", "description": "How many results, up to 10. Default: 5"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
             "description": "Create a new file, or replace a whole file. The user must approve it. Prefer edit_file for small changes.",
             "parameters": {
@@ -379,6 +423,7 @@ _READ_TOOLS = {
     "list_files": list_files,
     "read_file": read_file,
     "search_code": search_code,
+    "search_meaning": search_meaning,
 }
 _EDIT_TOOLS = {
     "write_file": write_file,

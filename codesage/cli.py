@@ -24,7 +24,7 @@ from codesage.agent import Agent
 from codesage.config import load_config
 from codesage.llm import LLM
 from codesage.storage import SessionStore
-from codesage.tools import COMMAND_REJECTED_MESSAGE, REJECTED_MESSAGE, Command, FileChange
+from codesage.tools import COMMAND_REJECTED_MESSAGE, REJECTED_MESSAGE, Command, FileChange, get_index
 
 console = Console()
 
@@ -38,6 +38,7 @@ HELP = """[bold]Commands[/bold]
   /sessions     list saved conversations for this project
   /resume N     continue saved conversation number N
   /context      show how much of the model's context is in use
+  /index        update the search index for this project now
   /exit         quit (or press Ctrl+D)
 Press Ctrl+C while a reply is streaming to stop it."""
 
@@ -205,6 +206,20 @@ def show_context(agent: Agent) -> None:
     )
 
 
+def update_index(agent: Agent) -> None:
+    """Index now, so the agent's first meaning search doesn't wait for it."""
+    try:
+        with console.status("Indexing the project…"):
+            stats = get_index(agent.root).update()
+    except Exception as e:  # missing library, model download failure, corrupt index...
+        console.print(f"[red]Could not update the index:[/red] {escape(str(e))}")
+        return
+    console.print(
+        f"[dim]{stats.total_chunks} pieces of code indexed: {stats.files_embedded} files embedded, "
+        f"{stats.files_unchanged} unchanged, {stats.files_removed} removed.[/dim]"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(prog="codesage", description="A terminal AI coding agent.")
     parser.add_argument(
@@ -269,6 +284,9 @@ def main():
             continue
         if user_input == "/context":
             show_context(agent)
+            continue
+        if user_input == "/index":
+            update_index(agent)
             continue
         if user_input.startswith("/resume"):
             number = user_input.removeprefix("/resume").strip()

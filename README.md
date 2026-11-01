@@ -19,6 +19,7 @@ A terminal AI coding agent that runs for free on a local LLM.
 - A live timer while the model works, and how long each step took
 - **Saved sessions:** every conversation is stored in SQLite per project; continue with `codesage --continue`, `/sessions` and `/resume N`
 - **Context management:** long conversations are trimmed automatically to fit the model's context window; `/context` shows usage
+- **RAG over your code:** `search_meaning` finds code by what it does, using local embeddings and ChromaDB; `/index` updates the index on demand
 
 ## How it works
 
@@ -34,6 +35,8 @@ All three providers accept the OpenAI chat API format, so CodeSage uses one clie
 
 **Context management:** before each request, `context.py` builds a shorter copy of the history that fits the window, leaving 2,048 tokens for the reply. It removes in order of least harm: old tool outputs (they can be fetched again), then the oldest whole turns (so a tool call is never separated from its result), then the current turn's other outputs, then part of the newest output. The full history stays in memory and in the database. Sizes use a 4-characters-per-token estimate, which measured about 12% above the model's real count on one test, the safe direction.
 
+**RAG:** `rag.py` splits Python files by function and other text files into overlapping line windows, embeds each piece with all-MiniLM-L6-v2 on the CPU, and stores the vectors in ChromaDB under `~/.codesage/index`. A question is embedded the same way and the closest pieces are returned. Only files whose content hash changed are embedded again, so the index stays current on every search. Only listed text file types are indexed, which keeps out `.env` secrets, and ChromaDB's telemetry is off. The only download is the embedding model, on first use (about 166 MB on disk).
+
 The agent loop (`agent.py`) knows nothing about the terminal: it talks to the screen through a small UI interface. That keeps the loop testable with a fake model and a fake UI.
 
 ```
@@ -44,12 +47,16 @@ codesage/
 │   ├── tools.py       # tool functions, their JSON schemas, safe file changes
 │   ├── context.py     # trims what is sent to fit the context window
 │   ├── storage.py     # saved sessions in SQLite
+│   ├── rag.py         # chunking, embeddings and meaning search
 │   ├── agent.py       # the agent loop (UI-independent)
 │   └── cli.py         # terminal UI: streaming, diffs, confirmations
+├── evals/
+│   └── retrieval_eval.py # meaning search vs keyword search
 └── tests/
     ├── test_tools.py   # unit tests for the tools
     ├── test_context.py # trimming rules
     ├── test_storage.py # saving and loading sessions
+    ├── test_rag.py     # chunking and the index, with a fake embedding
     └── test_agent.py   # agent loop tests with a scripted fake model
 ```
 
@@ -82,6 +89,20 @@ If you use a different size, set `CODESAGE_CONTEXT_TOKENS` to the same number so
 
 `qwen3:4b` reasons before every answer, so a multi-step task takes a few minutes on a 6 GB GPU. Turning that reasoning off does not help with this model: with `reasoning_effort="none"` (or Ollama's native `think: false`) qwen3:4b moves its reasoning into the answer text instead. On the same run-fix-rerun task, normal mode took 196 s and "thinking off" took 489 s with a cluttered answer, so CodeSage keeps normal mode. For faster replies, use a larger GPU or the Groq free tier (`CODESAGE_PROVIDER=groq`).
 
+## Does RAG help?
+
+`evals/retrieval_eval.py` asks 20 plain-English questions about CodeSage's own code, avoiding its exact names, and checks whether each search finds the expected code among 95 chunks:
+
+| Right code found in | Meaning search | Keyword search |
+|---|---|---|
+| Top 1 | 10/20 | 10/20 |
+| Top 3 | 15/20 | 12/20 |
+| Top 5 | 18/20 | 15/20 |
+
+They tie at the top result, and meaning search leads further down. They also miss different questions, so the agent keeps both tools. This is a small test on a small project, with questions written by the author, so treat it as a rough signal.
+
+Retrieval finding the code doesn't guarantee a right answer: in live tests `qwen3:4b` sometimes names a function that calls the relevant code rather than the function itself.
+
 ## Tests
 
 ```bash
@@ -96,5 +117,5 @@ pytest
 - [x] Day 3: agent loop + file editing with confirmation
 - [x] Day 4: `run_command` with permission prompts, nicer UI
 - [x] Day 5: saved sessions (SQLite) + context management
-- [ ] Day 6: RAG over the codebase (ChromaDB + sentence-transformers)
+- [x] Day 6: RAG over the codebase (ChromaDB + local embeddings)
 - [ ] Day 7: demo GIF, docs, release

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from codesage.agent import MAX_TOOL_ROUNDS, Agent
+from codesage.storage import SessionStore
 
 
 def tool_call(name: str, call_id: str = "call_1", **args) -> tuple[str, dict]:
@@ -147,6 +148,84 @@ def test_command_answer_no(project):
     agent = Agent(llm, project, FakeUI(command_answer="no"))
     agent.ask("run it")
     assert "did not allow" in agent.messages[3]["content"]
+
+
+@pytest.fixture
+def store(tmp_path: Path):
+    s = SessionStore(tmp_path / "db" / "sessions.db")
+    yield s
+    s.close()
+
+
+def test_conversation_is_saved_and_resumed(project, store):
+    llm = FakeLLM([tool_call("read_file", path="main.py")], [("text", "It prints hello.")])
+    first = Agent(llm, project, FakeUI(), store)
+    first.ask("what does main.py do?")
+
+    second = Agent(FakeLLM([("text", "Still hello.")]), project, FakeUI(), store)
+    assert second.resume(first.session_id)
+    assert second.messages == first.messages
+    second.ask("and now?")
+    assert len(store.load_messages(project, first.session_id)) == 6  # no duplicates
+
+
+def test_failed_turn_is_not_saved(project, store):
+    agent = Agent(FakeLLM([("text", "Hi")]), project, FakeUI(), store)
+    agent.ask("hello")
+    agent.llm = BrokenLLM()
+    with pytest.raises(ConnectionError):
+        agent.ask("this fails")
+    assert len(store.load_messages(project, agent.session_id)) == 2
+
+
+def test_resume_of_unknown_session_changes_nothing(project, store):
+    agent = Agent(FakeLLM([("text", "Hi")]), project, FakeUI(), store)
+    agent.ask("hello")
+    before = list(agent.messages)
+    assert not agent.resume(999)
+    assert agent.messages == before
+
+
+def test_always_allowed_commands_are_not_saved(project, store):
+    llm = FakeLLM([tool_call("run_command", command="echo hi")], [("text", "Done.")])
+    first = Agent(llm, project, FakeUI(command_answer="always"), store)
+    first.ask("run it")
+
+    second = Agent(FakeLLM(), project, FakeUI(), store)
+    second.resume(first.session_id)
+    assert second.allowed_commands == set()
+
+
+def test_clear_starts_a_new_saved_session(project, store):
+    agent = Agent(FakeLLM([("text", "One")], [("text", "Two")]), project, FakeUI(), store)
+    agent.ask("first")
+    first_id = agent.session_id
+    agent.reset()
+    agent.ask("second")
+    assert agent.session_id != first_id
+    assert len(store.list_sessions(project)) == 2
+
+
+def test_model_gets_trimmed_copy_but_full_history_is_kept(project, store):
+    class RecordingLLM(FakeLLM):
+        def stream_chat(self, messages, tools=None):
+            self.sent = messages
+            return super().stream_chat(messages, tools)
+
+    (project / "big.txt").write_text("line\n" * 100)
+    replies = []
+    for n in range(40):
+        replies.append([tool_call("read_file", call_id=f"call_{n}", path="big.txt")])
+        replies.append([("text", f"answer {n}")])
+    llm = RecordingLLM(*replies)
+    ui = FakeUI()
+    agent = Agent(llm, project, ui, store, max_context_tokens=4096)
+    for n in range(40):
+        agent.ask(f"question {n}")
+
+    assert len(llm.sent) < len(agent.messages)
+    assert len(store.load_messages(project, agent.session_id)) == 160
+    assert any("no longer sees" in w for w in ui.warnings)
 
 
 def test_reset_clears_conversation(project):

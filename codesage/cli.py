@@ -1,6 +1,8 @@
 """Interactive terminal front end for the agent."""
 
+import argparse
 import json
+import sqlite3
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -11,6 +13,7 @@ from prompt_toolkit.history import InMemoryHistory
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.spinner import Spinner
@@ -20,6 +23,7 @@ from codesage import __version__
 from codesage.agent import Agent
 from codesage.config import load_config
 from codesage.llm import LLM
+from codesage.storage import SessionStore
 from codesage.tools import COMMAND_REJECTED_MESSAGE, REJECTED_MESSAGE, Command, FileChange
 
 console = Console()
@@ -31,6 +35,9 @@ MAX_OUTPUT_PREVIEW_LINES = 8
 HELP = """[bold]Commands[/bold]
   /help         show this help
   /clear        start a fresh conversation
+  /sessions     list saved conversations for this project
+  /resume N     continue saved conversation number N
+  /context      show how much of the model's context is in use
   /exit         quit (or press Ctrl+D)
 Press Ctrl+C while a reply is streaming to stop it."""
 
@@ -167,14 +174,59 @@ class TerminalUI:
         console.print(f"[yellow]{text}[/yellow]")
 
 
+def show_sessions(agent: Agent) -> None:
+    sessions = agent.store.list_sessions(agent.root) if agent.store else []
+    if not sessions:
+        console.print("[dim]No saved conversations for this project yet.[/dim]")
+        return
+    for s in sessions:
+        current = " [cyan](current)[/cyan]" if s.id == agent.session_id else ""
+        console.print(
+            f"  [bold]{s.id}[/bold]  {escape(s.title)}  "
+            f"[dim]{s.updated_at} · {s.message_count} messages[/dim]{current}"
+        )
+    console.print("[dim]Continue one with /resume N[/dim]")
+
+
+def resume_session(agent: Agent, session_id: int) -> None:
+    if agent.resume(session_id):
+        console.print(f"[dim]Resumed conversation {session_id} ({len(agent.messages) - 1} messages).[/dim]")
+    else:
+        console.print(f"[red]No saved conversation {session_id} for this project.[/red] Try /sessions.")
+
+
+def show_context(agent: Agent) -> None:
+    fit = agent.context_usage()
+    console.print(
+        f"[dim]About {fit.tokens:,} of {fit.budget:,} available tokens in use "
+        f"({agent.max_context_tokens:,} total, minus tool descriptions and room for the reply). "
+        f"{len(agent.messages) - 1} messages; {fit.outputs_removed} old outputs removed "
+        f"and {fit.messages_dropped} messages hidden from the model.[/dim]"
+    )
+
+
 def main():
+    parser = argparse.ArgumentParser(prog="codesage", description="A terminal AI coding agent.")
+    parser.add_argument(
+        "-c", "--continue", dest="resume_latest", action="store_true",
+        help="continue the latest saved conversation for this project",
+    )
+    args = parser.parse_args()
+
     try:
         config = load_config()
     except ValueError as e:
         console.print(f"[red]Config error:[/red] {e}")
         return
 
-    agent = Agent(LLM(config), Path.cwd().resolve(), TerminalUI())
+    root = Path.cwd().resolve()
+    store = None
+    try:
+        store = SessionStore()
+    except (sqlite3.Error, OSError) as e:
+        console.print(f"[yellow]Conversations won't be saved: {e}[/yellow]")
+
+    agent = Agent(LLM(config), root, TerminalUI(), store, config.context_tokens)
     console.print(
         Panel.fit(
             f"[bold cyan]CodeSage[/bold cyan] v{__version__}\n"
@@ -184,6 +236,13 @@ def main():
             border_style="cyan",
         )
     )
+    if args.resume_latest:
+        latest = store.list_sessions(root, limit=1) if store else []
+        if latest:
+            resume_session(agent, latest[0].id)
+        else:
+            console.print("[dim]No saved conversation to continue; starting a new one.[/dim]")
+
     session = PromptSession(history=InMemoryHistory())
 
     while True:
@@ -205,6 +264,19 @@ def main():
             agent.reset()
             console.print("[dim]Conversation cleared.[/dim]")
             continue
+        if user_input == "/sessions":
+            show_sessions(agent)
+            continue
+        if user_input == "/context":
+            show_context(agent)
+            continue
+        if user_input.startswith("/resume"):
+            number = user_input.removeprefix("/resume").strip()
+            if number.isdigit():
+                resume_session(agent, int(number))
+            else:
+                console.print("Usage: /resume N  (see /sessions for the numbers)")
+            continue
 
         try:
             agent.ask(user_input)
@@ -218,6 +290,8 @@ def main():
         except KeyboardInterrupt:
             console.print("[dim]Stopped.[/dim]")
 
+    if store:
+        store.close()
     console.print("[dim]Bye![/dim]")
 
 

@@ -4,11 +4,15 @@ The agent knows nothing about the terminal. It talks to the screen through a
 small UI interface, so tests can drive it with a fake model and a fake UI.
 """
 
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
 
+from codesage.config import DEFAULT_CONTEXT_TOKENS
+from codesage.context import FitResult, fit_to_context
 from codesage.llm import LLM
+from codesage.storage import SessionStore
 from codesage.tools import SHELL_NAME, TOOLS, Command, FileChange, run_tool
 
 # Safety limit so a confused model can't call tools forever.
@@ -57,12 +61,22 @@ class UI(Protocol):
 
 
 class Agent:
-    def __init__(self, llm: LLM, root: Path, ui: UI):
+    def __init__(
+        self,
+        llm: LLM,
+        root: Path,
+        ui: UI,
+        store: SessionStore | None = None,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    ):
         self.llm = llm
         self.root = root
         self.ui = ui
+        self.store = store
+        self.max_context_tokens = max_context_tokens
         # Commands the user chose "always" for. Kept until CodeSage exits,
         # even across /clear, because it is a choice about the user's machine.
+        # Never saved to disk: a resumed session must ask again.
         self.allowed_commands: set[str] = set()
         self.reset()
 
@@ -71,6 +85,36 @@ class Agent:
         shell_note = " Use ';' between commands, not '&&'." if SHELL_NAME == "Windows PowerShell" else ""
         prompt = SYSTEM_PROMPT.format(cwd=self.root, shell=SHELL_NAME, shell_note=shell_note)
         self.messages = [{"role": "system", "content": prompt}]
+        self.session_id: int | None = None
+        self._saved_count = 1  # the system prompt is rebuilt, never saved
+        self._dropped_warned = 0
+
+    def resume(self, session_id: int) -> bool:
+        """Continue a saved conversation. False if this project has no such session."""
+        saved = self.store.load_messages(self.root, session_id) if self.store else None
+        if saved is None:
+            return False
+        self.reset()
+        self.messages.extend(saved)
+        self.session_id = session_id
+        self._saved_count = len(self.messages)
+        return True
+
+    def context_usage(self) -> FitResult:
+        """What the next request would send to the model."""
+        return fit_to_context(self.messages, TOOLS, self.max_context_tokens)
+
+    def _save(self) -> None:
+        """Save the new messages. A database problem must not lose the user's answer."""
+        if self.store is None:
+            return
+        try:
+            if self.session_id is None:
+                self.session_id = self.store.create_session(self.root, self.messages[1]["content"])
+            self.store.add_messages(self.session_id, self.messages[self._saved_count:])
+            self._saved_count = len(self.messages)
+        except sqlite3.Error as e:
+            self.ui.warn(f"Could not save this conversation: {e}")
 
     def confirm_command(self, command: Command) -> bool:
         """Ask the user about a command, unless they already chose "always" for it."""
@@ -90,12 +134,20 @@ class Agent:
         except BaseException:
             del self.messages[turn_start:]
             raise
+        self._save()
 
     def _run_tool_loop(self) -> None:
         """Model asks for a tool -> we run it -> the result goes back into
         messages -> the model is called again, until it gives a final answer."""
         for _ in range(MAX_TOOL_ROUNDS):
-            events = self.llm.stream_chat(self.messages, tools=TOOLS)
+            fit = self.context_usage()
+            if fit.messages_dropped > self._dropped_warned:
+                self._dropped_warned = fit.messages_dropped
+                self.ui.warn(
+                    f"This conversation is long: the model no longer sees the oldest "
+                    f"{fit.messages_dropped} messages. They are still saved."
+                )
+            events = self.llm.stream_chat(fit.messages, tools=TOOLS)
             answer, tool_calls = self.ui.stream_reply(events)
             if not tool_calls:
                 self.messages.append({"role": "assistant", "content": answer})

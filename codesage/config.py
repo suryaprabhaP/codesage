@@ -20,12 +20,18 @@ DEFAULT_MODELS = {
 }
 
 
+# Must match the context size the model really runs with (for Ollama, OLLAMA_CONTEXT_LENGTH).
+DEFAULT_CONTEXT_TOKENS = 8192
+MIN_CONTEXT_TOKENS = 4096
+
+
 @dataclass
 class Config:
     provider: str
     model: str
     base_url: str
     api_key: str
+    context_tokens: int = DEFAULT_CONTEXT_TOKENS
 
 
 def load_config() -> Config:
@@ -43,4 +49,8 @@ def load_config() -> Config:
     if provider != "ollama" and api_key == "ollama":
         raise ValueError(f"CODESAGE_API_KEY is required for provider '{provider}'.")
 
-    return Config(provider, model, PROVIDERS[provider], api_key)
+    setting = os.getenv("CODESAGE_CONTEXT_TOKENS") or str(DEFAULT_CONTEXT_TOKENS)
+    if not setting.isdigit() or int(setting) < MIN_CONTEXT_TOKENS:
+        raise ValueError(f"CODESAGE_CONTEXT_TOKENS must be a number of at least {MIN_CONTEXT_TOKENS}.")
+
+    return Config(provider, model, PROVIDERS[provider], api_key, int(setting))
